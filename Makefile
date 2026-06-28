@@ -40,11 +40,12 @@
 #   SUBMODULES <- nested go.mod dirs (excluding vendor/testdata/fixtures)
 # Override either on the command line for the rare repo that needs to.
 #
-# The canonical tool set lives in ONE place — the `tool (...)` stanza of
-# nicerobot/tools.build/go-tooling/go.mod — and is installed as real binaries into
-# $GOBIN (see the tools section below). Consumer repos carry NO tool stanza and
-# vendor NO tool dependencies; this Makefile resolves every tool from $(GOBIN)
-# only and fails loudly if it is missing.
+# The canonical tool set lives in ONE place — the pinned manifest
+# nicerobot/tools.build/go-tooling/tools.txt — and is installed as real binaries
+# into $GOBIN via `go install path@version` (see the tools section below).
+# Consumer repos carry NO tool stanza and vendor NO tool dependencies; this
+# Makefile resolves every tool from $(GOBIN) only and fails loudly if it is
+# missing.
 
 # A Self-Documenting Makefile: http://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
 .DEFAULT_GOAL := test
@@ -177,7 +178,7 @@ $(BUILD_DIR) $(COVERAGE_FOLDER):
 # consumers are green, so they are enforced on every push now — coverage and
 # vulnerabilities can no longer silently regress in CI.
 .PHONY: ci
-ci: lint staticcheck vulncheck cover-gate test-all build-all ## Aggregate target for CI builds
+ci: standards-validate lint staticcheck vulncheck cover-gate test-all build-all ## Aggregate target for CI builds
 
 # True CI parity: run the real `ci` recipe INSIDE the baked toolchain image,
 # so it uses the pinned tools and the exact base environment CI runs in — not the
@@ -197,21 +198,54 @@ ci-local: ## Run the CI aggregate inside the baked image, exactly as CI does
 
 ##@ Code Quality
 
+# --------------------------------------------------------------------------- #
+# Standards exemptions (anti-rot ratchet)
+# --------------------------------------------------------------------------- #
+# A repo may carry a hand-authored .standards.yaml declaring capabilities it does
+# NOT yet satisfy (registry: nicerobot/tools.build/standards/capabilities.yaml),
+# each with a reason:
+#
+#   exempt:
+#     gate:coverage: "legacy paths uncovered; backfill tracked in <issue>"
+#
+# Each gate step routes through `standards-run`, which applies the ratchet:
+#   - capability NOT exempt  -> run the step, pass its exit through (default).
+#   - exempt AND step FAILS  -> the declared gap holds; warn and succeed.
+#   - exempt AND step PASSES -> the exemption is STALE; fail so it gets removed.
+# Exemptions can only shrink. With no .standards.yaml, EXEMPT is empty and every
+# step behaves exactly as before — zero change for the common case.
+STANDARDS_FILE ?= .standards.yaml
+EXEMPT := $(if $(wildcard $(STANDARDS_FILE)),$(shell yq -r '.exempt // {} | keys | .[]' $(STANDARDS_FILE) 2>/dev/null))
+
+# $(call standards-run,<capability>,<command>) — see the ratchet table above.
+define standards-run
+$(if $(filter $(1),$(EXEMPT)),if $(2); then echo "STANDARDS: stale exemption '$(1)' now PASSES — remove it from $(STANDARDS_FILE)" >&2; exit 1; else echo "STANDARDS: '$(1)' exempt (declared gap, not enforced)" >&2; fi,$(2))
+endef
+
+# standards-validate: every exemption must carry a non-empty reason string. (Full
+# registry-membership validation lives in `git repo standards verify`, which has
+# the registry; the gate stays self-contained so it runs unchanged in the CI image.)
+.PHONY: standards-validate
+standards-validate: ## Validate .standards.yaml exemptions carry reasons
+	@test -f $(STANDARDS_FILE) || exit 0; \
+	bad=$$(yq -r '.exempt // {} | to_entries | map(select(.value == null or .value == "")) | .[].key' $(STANDARDS_FILE) 2>/dev/null); \
+	test -z "$$bad" || { echo "STANDARDS: exemptions missing a reason: $$bad" >&2; exit 1; }
+
 # `check` is the comprehensive DEVELOPER gate: run it locally before pushing. It
 # is the static + `vulncheck` + 100%-`cover` core that `ci` ALSO enforces, so a
 # local `check` pass predicts a green CI; `ci` is a superset that additionally
 # runs `test-all` (race) and `build-all` (cross-compile). The complexity linters
 # are part of `lint` now (folded into .golangci.yaml).
 .PHONY: check
-check: lint staticcheck vulncheck cover-gate ## Full developer gate (CI runs this + race & cross-compile)
+check: standards-validate lint staticcheck vulncheck cover-gate ## Full developer gate (CI runs this + race & cross-compile)
 
 # cover-gate routes the coverage step through $(COVER_GATE) (default `cover`) so
 # a repo can swap the coverage policy by setting COVER_GATE in Makefile.local —
 # without redefining `check`, `ci`, or `cover`. Deferred to a sub-make so the
 # Makefile.local override (read at the tail) is in effect when it runs.
 .PHONY: cover-gate
-cover-gate: ## Run the active coverage gate (COVER_GATE, default `cover`)
-	@$(MAKE) $(COVER_GATE)
+cover-gate: ## Run the active coverage gate (COVER_GATE, default `cover`), ratchet-aware
+	@$(call standards-run,gate:coverage,$(MAKE) $(COVER_GATE))
 
 # Per-submodule vet targets via a static pattern rule (NOT `vet-%:` — GNU make
 # skips implicit/pattern rules for phony targets; a static pattern with an
@@ -223,13 +257,38 @@ vet: $(VET_SUBMODULES) ## Run go vet (root module + submodules)
 $(VET_SUBMODULES): vet@%:
 	go vet -C $* ./...
 
-.PHONY: lint
-lint: vet ## Run golangci-lint (incl. the central complexity linters)
+# golangci-lint config resolution. A repo may ship a .golangci.override.yml
+# carrying ONLY its delta (e.g. one extra gosec exclude). When present, lint
+# deep-merges it OVER the distributed .golangci.yaml — scalars overridden, arrays
+# APPENDED (yq's `*+`) — into an effective config under the git-ignored $(COVERAGE_FOLDER)/
+# and lints against that. With no override, golangci-lint auto-discovers the
+# distributed .golangci.yaml exactly as before. This keeps the centralized config
+# managed/clobberable (distribute-build owns .golangci.yaml) while letting a
+# single repo EXTEND it without an in-tree edit the next distribute would erase.
+GOLANGCI_OVERRIDE  := $(wildcard .golangci.override.yml)
+GOLANGCI_EFFECTIVE := $(COVERAGE_FOLDER)/golangci.effective.yml
+
+.PHONY: lint-raw
+lint-raw: vet
+ifeq ($(GOLANGCI_OVERRIDE),)
 	$(GOLANGCI_LINT) run
+else
+	@mkdir -p $(COVERAGE_FOLDER)
+	yq eval-all '. as $$item ireduce ({}; . *+ $$item)' .golangci.yaml $(GOLANGCI_OVERRIDE) > $(GOLANGCI_EFFECTIVE)
+	$(GOLANGCI_LINT) run --config $(GOLANGCI_EFFECTIVE)
+endif
+
+.PHONY: lint
+lint: ## Run golangci-lint (ratchet-aware; override-merged config if .golangci.override.yml present)
+	@$(call standards-run,gate:lint,$(MAKE) lint-raw)
+
+.PHONY: staticcheck-raw
+staticcheck-raw:
+	$(STATICCHECK) ./...
 
 .PHONY: staticcheck
-staticcheck: ## Run staticcheck
-	$(STATICCHECK) ./...
+staticcheck: ## Run staticcheck (ratchet-aware)
+	@$(call standards-run,gate:staticcheck,$(MAKE) staticcheck-raw)
 
 # VULNCHECK_SCAN is the govulncheck precision knob. The default `symbol` builds
 # the call graph and reports only vulnerabilities actually reachable from a
@@ -241,9 +300,13 @@ staticcheck: ## Run staticcheck
 # a finding. Drop back to `symbol` once upstream fixes the panic.
 VULNCHECK_SCAN ?= symbol
 
-.PHONY: vulncheck
-vulncheck: ## Run govulncheck
+.PHONY: vulncheck-raw
+vulncheck-raw:
 	$(GOVULNCHECK) -mode=source -scan=$(VULNCHECK_SCAN) ./...
+
+.PHONY: vulncheck
+vulncheck: ## Run govulncheck (ratchet-aware)
+	@$(call standards-run,gate:vulncheck,$(MAKE) vulncheck-raw)
 
 ##@ Test
 
