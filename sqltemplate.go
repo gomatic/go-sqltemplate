@@ -17,8 +17,13 @@
 //
 //	select * from (select 1) as s where name=$1::text and value=$2::text
 //
-// with bindings ["abc", "123"]. Verbatim values are sanitized before
-// substitution; bind values are passed to the driver untouched.
+// with bindings ["abc", "123"]. Bind values ({{name}}) are passed to the driver
+// untouched — the $N placeholders make them injection-safe regardless of content.
+//
+// Verbatim values ({{.name}}) are substituted directly into the SQL text, so they
+// must be TRUSTED fragments (e.g. a controlled sub-query source). The strip of
+// ;'" is only a backstop, not a defense against injection; never feed untrusted
+// input through {{.name}} — use a {{name}} bind placeholder instead.
 //
 // The package is pure and has no dependencies beyond the standard library: it
 // performs only string and text/template work and never touches a database or
@@ -63,10 +68,7 @@ type Result struct {
 	Bindings []Value `json:"bindings"`
 }
 
-const (
-	maxNameLength  = 30
-	maxValueLength = 50
-)
+const maxNameLength = 30
 
 var (
 	reStaticVariable  = regexp.MustCompile(`[{]{2}[.]([^}]+)[}]{2}`)
@@ -80,32 +82,37 @@ func Normalize(statement Statement) Statement {
 	return Statement(reWhitespace.ReplaceAllString(string(statement), " "))
 }
 
-// Clean returns the sanitized value and whether the named parameter is usable.
-// Internal names (prefixed with "." or "_") and over-long names or values are
-// rejected; characters that could break out of a verbatim substitution are
-// stripped.
-func Clean(name Name, value Value) (Value, bool) {
-	switch {
-	case len(name) == 0, len(name) > maxNameLength:
-		return "", false
-	case strings.HasPrefix(string(name), "."), strings.HasPrefix(string(name), "_"):
-		return "", false
-	case len(value) == 0, len(value) > maxValueLength:
-		return "", false
-	default:
-		return Value(valueStripper.Replace(string(value))), true
+// validName reports whether a variable name may be substituted. Internal names
+// (prefixed with "." or "_") and over-long names are rejected. Values are not
+// constrained — a bind value may be any length, including empty.
+func validName(name Name) bool {
+	if len(name) == 0 || len(name) > maxNameLength {
+		return false
 	}
+	return !strings.HasPrefix(string(name), ".") && !strings.HasPrefix(string(name), "_")
 }
 
-// clean returns only the parameters that survive sanitization.
-func clean(params Params) Params {
-	cleaned := make(Params, len(params))
+// usable returns the parameters whose names are valid, with values UNTOUCHED so
+// that bind values reach the driver unmodified.
+func usable(params Params) Params {
+	out := make(Params, len(params))
 	for name, value := range params {
-		if sanitized, ok := Clean(name, value); ok {
-			cleaned[name] = sanitized
+		if validName(name) {
+			out[name] = value
 		}
 	}
-	return cleaned
+	return out
+}
+
+// sanitizeStatic strips characters that could break out of a verbatim {{.name}}
+// substitution. It applies only to the static path; bind values are never
+// sanitized.
+func sanitizeStatic(params Params) Params {
+	out := make(Params, len(params))
+	for name, value := range params {
+		out[name] = Value(valueStripper.Replace(string(value)))
+	}
+	return out
 }
 
 // binder assigns ordered, value-deduplicated bind placeholders.
@@ -168,11 +175,11 @@ func restoreMissing(query Query) Query {
 
 // Parameterize renders statement against params into a query plus bindings.
 func Parameterize(statement Statement, params Params) (Result, error) {
-	usable := clean(params)
-	prepared := replaceStatics(Normalize(statement), usable)
+	use := usable(params)
+	prepared := replaceStatics(Normalize(statement), sanitizeStatic(use))
 
 	binder := newBinder()
-	parsed, err := template.New("").Funcs(binder.funcs(usable)).Parse(string(prepared))
+	parsed, err := template.New("").Funcs(binder.funcs(use)).Parse(string(prepared))
 	if err != nil {
 		return Result{}, fmt.Errorf("%w: %w", ErrInvalidStatement, err)
 	}
