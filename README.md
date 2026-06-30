@@ -1,6 +1,8 @@
 # go-sqltemplate
 
-Rewrite a SQL template into a parameterized query. A statement carries two kinds of variable: `{{name}}` becomes an ordered, value-deduplicated bind placeholder (`$1`, `$2`, …) whose values are returned alongside the query, and `{{.name}}` is substituted verbatim (sanitized) for composing SQL fragments such as a sub-query source.
+Rewrite a SQL template into a parameterized query. A statement carries two kinds of variable: `{{name}}` becomes an ordered, value-deduplicated bind placeholder (`$1`, `$2`, …) whose values are returned alongside the query, and `{{.name}}` is substituted verbatim into the SQL text for composing fragments such as a sub-query source.
+
+The package performs only string and `text/template` work — it never touches a database or driver, and has no dependencies beyond the standard library.
 
 ## Install
 
@@ -32,7 +34,12 @@ func main() {
 }
 ```
 
-Verbatim values are sanitized before substitution; bind values are passed through untouched for the driver to parameterize. A statement that cannot be parsed or rendered returns an error matchable with `errors.Is(err, sqltemplate.ErrInvalidStatement)`.
+## Security
+
+- **`{{name}}` bind values are safe with any input.** They are passed to the driver untouched as `$N` parameters — quotes, semicolons, and comment markers in a bind value are preserved and can never alter the statement's structure.
+- **`{{.name}}` verbatim values must be TRUSTED.** They are written directly into the SQL text. The library strips `;`, `'`, and `"` as a backstop only — that is **not** a defense against injection (it leaves `--`, `/* */`, `OR 1=1`, parentheses, etc. intact). Never feed untrusted input through `{{.name}}`; use a `{{name}}` bind placeholder instead.
+
+A statement that cannot be parsed or rendered returns an error matchable with `errors.Is(err, sqltemplate.ErrInvalidStatement)`.
 
 ## Maintenance
 
