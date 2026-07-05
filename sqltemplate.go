@@ -36,17 +36,13 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+
+	errs "github.com/gomatic/go-error"
 )
-
-// Error is the sentinel error type for the sqltemplate package.
-type Error string
-
-// Error returns the error message.
-func (e Error) Error() string { return string(e) }
 
 // ErrInvalidStatement is returned when a statement cannot be parsed or rendered
 // into a parameterized query.
-const ErrInvalidStatement Error = "sqltemplate: invalid sql statement"
+const ErrInvalidStatement errs.Const = "sqltemplate: invalid sql statement"
 
 type (
 	// Statement is a SQL template containing {{name}} and {{.name}} variables.
@@ -183,12 +179,12 @@ func Parameterize(statement Statement, params Params) (Result, error) {
 	binder := newBinder()
 	parsed, err := template.New("").Funcs(binder.funcs(use)).Parse(string(prepared))
 	if err != nil {
-		return Result{}, fmt.Errorf("%w: %w", ErrInvalidStatement, err)
+		return Result{}, ErrInvalidStatement.With(err)
 	}
 
 	var rendered bytes.Buffer
 	if err := parsed.Execute(&rendered, nil); err != nil {
-		return Result{}, fmt.Errorf("%w: %w", ErrInvalidStatement, err)
+		return Result{}, ErrInvalidStatement.With(err)
 	}
 
 	return Result{

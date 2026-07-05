@@ -1,8 +1,10 @@
 package sqltemplate_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -105,6 +107,9 @@ func TestParameterizeExecuteError(t *testing.T) {
 	// Parses cleanly but fails at execution because the named template is undefined.
 	_, err := sqltemplate.Parameterize(`{{template "nope"}}`, nil)
 	assert.ErrorIs(t, err, sqltemplate.ErrInvalidStatement)
+	// The wrap must keep the underlying cause recoverable, not just the sentinel.
+	var cause template.ExecError
+	assert.True(t, errors.As(err, &cause))
 }
 
 func TestParameterizeEmptyStatement(t *testing.T) {
