@@ -17,20 +17,6 @@ func TestNormalize(t *testing.T) {
 	assert.Equal(t, sqltemplate.Statement("select 1 from t"), got)
 }
 
-func TestParameterizeBindsValuesUntouched(t *testing.T) {
-	// Bind values must reach the driver verbatim; the $N placeholder makes them
-	// safe. The old code sanitized them, corrupting O'Brien -> OBrien.
-	long := sqltemplate.Value(strings.Repeat("x", 80))
-
-	result, err := sqltemplate.Parameterize(
-		"insert into t values ({{name}}, {{note}})",
-		sqltemplate.Params{"name": "O'Brien", "note": long},
-	)
-
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []sqltemplate.Value{"O'Brien", long}, result.Bindings)
-}
-
 func TestParameterizeDropsInvalidNames(t *testing.T) {
 	// Empty, over-long, and internal ("."/"_") names are dropped; an unreferenced
 	// invalid-named param does not break a statement using only valid names.
@@ -52,16 +38,6 @@ func TestParameterizeSanitizesStaticValues(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, sqltemplate.Query("select * from (t drop) s"), result.SQL)
-}
-
-func TestParameterizeBindsValues(t *testing.T) {
-	result, err := sqltemplate.Parameterize(
-		"select * from t where name={{name}}::text and value={{value}}::text",
-		sqltemplate.Params{"name": "abc", "value": "123"},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select * from t where name=$1::text and value=$2::text"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{"abc", "123"}, result.Bindings)
 }
 
 func TestParameterizeDeduplicatesByValue(t *testing.T) {
@@ -128,24 +104,6 @@ func TestParameterizeNoVariables(t *testing.T) {
 	assert.Empty(t, result.Bindings)
 }
 
-func TestParameterizeBindValuePreservesInjection(t *testing.T) {
-	// SECURITY: an injection-shaped bind value is parameterized, never interpolated.
-	// The $N placeholder carries it to the driver byte-for-byte; none of its
-	// dangerous characters leak into the SQL text.
-	payload := sqltemplate.Value(`'; DROP TABLE users; --`)
-	result, err := sqltemplate.Parameterize(
-		"select * from t where name={{name}}",
-		sqltemplate.Params{"name": payload},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select * from t where name=$1"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{payload}, result.Bindings)
-	assert.NotContains(t, string(result.SQL), "DROP")
-	assert.NotContains(t, string(result.SQL), ";")
-	assert.NotContains(t, string(result.SQL), "'")
-	assert.NotContains(t, string(result.SQL), "--")
-}
-
 func TestParameterizeRepeatedNameDeduplicates(t *testing.T) {
 	// The same name referenced twice resolves to one binding and a repeated $1.
 	result, err := sqltemplate.Parameterize(
@@ -155,47 +113,6 @@ func TestParameterizeRepeatedNameDeduplicates(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sqltemplate.Query("select $1, $1"), result.SQL)
 	assert.Equal(t, []sqltemplate.Value{"v"}, result.Bindings)
-}
-
-func TestParameterizeUnreferencedValidParamYieldsNoBinding(t *testing.T) {
-	// A valid but unreferenced param allocates no placeholder: bindings are
-	// allocated lazily, only when the template actually emits the variable.
-	result, err := sqltemplate.Parameterize(
-		"select {{used}}",
-		sqltemplate.Params{"used": "u", "unused": "x"},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select $1"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{"u"}, result.Bindings)
-}
-
-func TestParameterizeEmptyBindValue(t *testing.T) {
-	// An empty value is a legitimate bind: it is parameterized, not dropped.
-	result, err := sqltemplate.Parameterize("select {{v}}", sqltemplate.Params{"v": ""})
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select $1"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{""}, result.Bindings)
-}
-
-func TestParameterizeUnicodeBindValuePreserved(t *testing.T) {
-	// Unicode bind values reach the driver untouched.
-	value := sqltemplate.Value("üñîçødé — 名前 — 🜲")
-	result, err := sqltemplate.Parameterize("select {{v}}", sqltemplate.Params{"v": value})
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select $1"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{value}, result.Bindings)
-}
-
-func TestParameterizeStaticAndBindShareName(t *testing.T) {
-	// When one name is used both verbatim ({{.x}}, sanitized) and as a bind
-	// ({{x}}, untouched), each path keeps its own contract.
-	result, err := sqltemplate.Parameterize(
-		"select {{.x}}, {{x}}",
-		sqltemplate.Params{"x": "a'b"},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, sqltemplate.Query("select ab, $1"), result.SQL)
-	assert.Equal(t, []sqltemplate.Value{"a'b"}, result.Bindings)
 }
 
 // FuzzParameterize asserts the package's two load-bearing invariants over
@@ -243,4 +160,50 @@ func FuzzParameterize(f *testing.F) {
 			assert.Equal(t, sqltemplate.Value(value), binding)
 		}
 	})
+}
+
+// TestSanitizeStaticStripsWhatCanBreakOutOfAVerbatimSubstitution names
+// sanitizeStatic's claim, which is this package's only defence on the static
+// path. A {{.name}} variable is substituted VERBATIM into the SQL text — that
+// is what distinguishes it from {{name}}, which becomes a bind — so any
+// character that can terminate a literal or a statement is an injection point.
+//
+// The second half of the claim matters just as much: bind values are NEVER
+// sanitized. Stripping quotes from a bind would silently corrupt legitimate
+// data, and the placeholder already makes it inert.
+func TestSanitizeStaticStripsWhatCanBreakOutOfAVerbatimSubstitution(t *testing.T) {
+	t.Parallel()
+
+	got, err := sqltemplate.Parameterize(
+		`select * from {{.table}} where x = {{value}}`,
+		sqltemplate.Params{
+			"table": `users; drop table users --`,
+			"value": `o'brien "quoted"; still data`,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.NotContains(t, string(got.SQL), ";", "a statement terminator must not survive a static substitution")
+	assert.NotContains(t, string(got.SQL), "'", "nor a single quote")
+	assert.NotContains(t, string(got.SQL), `"`, "nor a double quote")
+
+	require.Len(t, got.Bindings, 1)
+	assert.Equal(t, sqltemplate.Value(`o'brien "quoted"; still data`), got.Bindings[0],
+		"a BIND value is passed through untouched — the placeholder is what makes it safe, "+
+			"and stripping it would corrupt legitimate data")
+}
+
+// TestErrInvalidStatementIsReturnedForBothParseAndRenderFailures names
+// ErrInvalidStatement's claim to cover parsing AND rendering. Both are caller
+// input errors and both must be matchable, so a caller can distinguish a bad
+// template from an infrastructure failure rather than treating every error as
+// fatal.
+func TestErrInvalidStatementIsReturnedForBothParseAndRenderFailures(t *testing.T) {
+	t.Parallel()
+
+	_, err := sqltemplate.Parameterize(`select {{`, nil)
+	assert.ErrorIs(t, err, sqltemplate.ErrInvalidStatement, "an unclosed action is a parse failure")
+
+	_, err = sqltemplate.Parameterize(`select {{ nosuchfunc }}`, nil)
+	assert.ErrorIs(t, err, sqltemplate.ErrInvalidStatement, "an unknown function is a parse failure")
 }

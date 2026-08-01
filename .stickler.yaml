@@ -7,4 +7,4 @@
 # The rest are HARD rules softened only for rollout, and return to gating
 # once their counts reach zero.
 soft-baseline:
-  yze/invariant: 3
+  yze/invariant: 0
