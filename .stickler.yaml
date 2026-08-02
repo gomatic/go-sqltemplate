@@ -6,5 +6,12 @@
 # yze/invariant and yze/filesize are permanent probes (judgment-bound).
 # The rest are HARD rules softened only for rollout, and return to gating
 # once their counts reach zero.
+# `soft:` is what makes a rule non-gating; `soft-baseline:` is only the
+# per-rule ceiling APPLIED TO the rules named here. A baseline without a
+# matching soft entry is inert — the rule stays hard and fails on its first
+# finding whatever number is recorded beside it.
+soft:
+  - yze/invariant
+
 soft-baseline:
   yze/invariant: 0
