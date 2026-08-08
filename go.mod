@@ -3,7 +3,7 @@ module github.com/gomatic/go-sqltemplate
 go 1.26.4
 
 require (
-	github.com/gomatic/go-error v0.3.13
+	github.com/gomatic/go-error v0.3.14
 	github.com/stretchr/testify v1.11.1
 )
 
